@@ -31,7 +31,7 @@ jobs:
 
     - name: Sync Spark Jobs
       run: |
-        gsutil -m rsync -r -d ./spark_jobs/ gs://${{ secrets.COMPOSER_BUCKET }}/spark_jobs/
+        gsutil -m rsync -r -d ./spark_jobs/ gs://${{ secrets.PIPELINE_BUCKET }}/spark_jobs/
 
     - name: Notify on failure
       if: ${{ failure() }}

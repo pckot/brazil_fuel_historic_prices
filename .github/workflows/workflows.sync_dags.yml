@@ -1,0 +1,46 @@
+name: Sync Airflow DAGs to GCP Composer 
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'dags/**'
+      - 'spark_jobs/**'
+
+jobs:
+  sync-dags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Sync DAGs
+      run: |
+        gsutil -m rsync -r -d ./dags/ gs://${{ secrets.COMPOSER_BUCKET }}/dags/
+
+    - name: Sync Spark Jobs
+      run: |
+        gsutil -m rsync -r -d ./spark_jobs/ gs://${{ secrets.COMPOSER_BUCKET }}/spark_jobs/
+
+    - name: Notify on failure
+      if: ${{ failure() }}
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: "⚠️ DAG sync failed! Check workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          })

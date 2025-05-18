@@ -1,26 +1,25 @@
 from datetime import datetime, timedelta
 import os
-
+import re
 from airflow import DAG
 from airflow.providers.google.cloud.operators.dataproc import (
     DataprocCreateClusterOperator,
     DataprocDeleteClusterOperator,
     DataprocSubmitJobOperator
 )
-from airflow.operators.python import PythonOperator
-
+from airflow.decorators import task, dag
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from google.cloud import bigquery
+from airflow.utils.task_group import TaskGroup
+from airflow.models.baseoperator import chain
 
 BQ_DATASET_ID = os.environ.get('BQ_DATASET_ID')
 COMPOSER_SA = os.environ.get('COMPOSER_SA')
-COMPOSER_BUCKET = os.environ.get('COMPOSER_BUCKET')
 GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 GCP_REGION = os.environ.get('GCP_REGION')
 PIPELINE_BUCKET = os.environ.get('PIPELINE_BUCKET')
 SPARK_TEMP_BUCKET = os.environ.get('SPARK_TEMP_BUCKET')
-
-print('')
-print(f'COMPOSER BUCKET = {COMPOSER_BUCKET}')
-print('')
 
 DEFAULT_ARGS = {
     'owner': 'airflow',
@@ -31,7 +30,6 @@ DEFAULT_ARGS = {
     'retry_delay': timedelta(minutes=5),
     'start_date': datetime(2025, 4, 21),
 }
-
 
 CLUSTER_NAME = 'etl-spark-cluster-{{ ds_nodash }}'
 CLUSTER_CONFIG = {
@@ -61,76 +59,235 @@ CLUSTER_CONFIG = {
     },
 }
 
-
-PYSPARK_JOB = {
-    'reference': {'project_id': GCP_PROJECT_ID},
-    'placement': {'cluster_name': CLUSTER_NAME},
-    'pyspark_job': {
-        'main_python_file_uri': f'gs://{PIPELINE_BUCKET}/spark_jobs/write_to_bq.py',
-        'args': [
-            f'gs://{PIPELINE_BUCKET}/fuel_prices_2004_01.csv',
-            BQ_DATASET_ID,
-            'fuel_prices',
-            SPARK_TEMP_BUCKET
-        ],
-        'jar_file_uris': [
-            'gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.31.1.jar'
-        ],
-        'properties': {
-            'spark.executor.memory': '1g',
-            'spark.driver.memory': '2g',
-            'spark.executor.cores': '1',
-            'spark.dynamicAllocation.enabled': 'false',
-        },
-    },
-}
-
-def _print_execution_date(**kwargs):
-    print(f'Execution date: {kwargs["execution_date"]}')
-    return f'Execution date: {kwargs["execution_date"]}'
-
-
-with DAG(
-    'gcs_to_bq',
+# The main DAG definition using the TaskFlow API
+@dag(
+    dag_id='gcs_to_bq',
     default_args=DEFAULT_ARGS,
     description='ETL pipeline to process data from GCS to BigQuery',
     schedule_interval=None,
     catchup=False,
-    tags=['test'],
-) as dag:
-
-    print_execution_date = PythonOperator(
-        task_id='print_execution_date',
-        python_callable=_print_execution_date,
-        provide_context=True,
-    )
-
-    create_dataproc_cluster = DataprocCreateClusterOperator(
+    tags=['data_ingestion'],
+)
+def gcs_to_bq_dag():
+    
+    # @task
+    # def print_execution_date(**kwargs):
+    #     print(f'Execution date: {kwargs["execution_date"]}')
+    #     return f'Execution date: {kwargs["execution_date"]}'
+    
+    @task
+    def check_create_reference_table():
+        """
+        Check if the processed_files_reference table exists in BigQuery. 
+        If not, create it.
+        """
+        bq_hook = BigQueryHook(use_legacy_sql=False)
+        client = bq_hook.get_client()
+        
+        table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference"
+        
+        try:
+            client.get_table(table_id)
+            print(f"Table {table_id} already exists")
+        except Exception as e:
+            print(f"Table {table_id} does not exist. Creating it...")
+            
+            schema = [
+                bigquery.SchemaField("file_name", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("processed_at", "TIMESTAMP", mode="REQUIRED")
+            ]
+            
+            table = bigquery.Table(table_id, schema=schema)
+            client.create_table(table)
+            print(f"Table {table_id} created successfully")
+        
+        return True  # Indicate successful completion
+    
+    @task
+    def get_files_to_process():
+        """
+        List all files in the GCS bucket that match the pattern fuel_prices_YEAR_SEMESTER.csv
+        and check which ones have not been processed yet.
+        """
+        # Get files from GCS
+        gcs_hook = GCSHook()
+        files = gcs_hook.list(PIPELINE_BUCKET)
+        
+        # Filter files matching pattern
+        pattern = r'fuel_prices_\d{4}_\d{2}\.csv'
+        matching_files = [f for f in files if re.match(pattern, f)]
+        
+        # Get already processed files from BigQuery
+        bq_hook = BigQueryHook(use_legacy_sql=False)
+        
+        try:
+            processed_files = bq_hook.get_pandas_df(
+                f"SELECT file_name FROM `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference`"
+            )
+            processed_files_list = processed_files['file_name'].tolist() if not processed_files.empty else []
+        except Exception as e:
+            print(f"Error querying reference table: {e}")
+            processed_files_list = []
+        
+        # Filter only files that need processing
+        files_to_process = [f for f in matching_files if f not in processed_files_list]
+        
+        print(f"Found {len(matching_files)} matching files")
+        print(f"Already processed: {len(processed_files_list)} files")
+        print(f"Files to process: {len(files_to_process)}")
+        
+        # Return list of files to process (automatically pushed to XCom)
+        return files_to_process
+    
+    @task
+    def process_file(file_name, **kwargs):
+        """
+        Create PySpark job config for a specific file.
+        """
+        pyspark_job = {
+            'reference': {'project_id': GCP_PROJECT_ID},
+            'placement': {'cluster_name': CLUSTER_NAME},
+            'pyspark_job': {
+                'main_python_file_uri': f'gs://{PIPELINE_BUCKET}/spark_jobs/write_to_bq.py',
+                'args': [
+                    f'gs://{PIPELINE_BUCKET}/{file_name}',
+                    BQ_DATASET_ID,
+                    'fuel_prices',
+                    SPARK_TEMP_BUCKET
+                ],
+                'jar_file_uris': [
+                    'gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.31.1.jar'
+                ],
+                'properties': {
+                    'spark.executor.memory': '1g',
+                    'spark.driver.memory': '2g',
+                    'spark.executor.cores': '1',
+                    'spark.dynamicAllocation.enabled': 'false',
+                },
+            },
+        }
+        return pyspark_job
+    
+    @task
+    def record_processed_file(file_name, **kwargs):
+        """
+        Record the processed file in the reference table.
+        """
+        bq_hook = BigQueryHook(use_legacy_sql=False)
+        
+        query = f"""
+        INSERT INTO `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference` 
+        (file_name, processed_at)
+        VALUES('{file_name}', CURRENT_TIMESTAMP())
+        """
+        
+        bq_hook.run_query(query)
+        print(f"Recorded {file_name} as processed")
+        return True
+    
+    @task
+    def should_create_cluster(files_to_process):
+        """
+        Determine if we should create a cluster based on whether there are files to process.
+        """
+        has_files = len(files_to_process) > 0
+        print(f"Has files to process: {has_files}")
+        return has_files
+    
+    # Execute the tasks
+    # exec_date = print_execution_date()
+    ref_table_created = check_create_reference_table()
+    files_to_process = get_files_to_process()
+    create_cluster_decision = should_create_cluster(files_to_process)
+    
+    # Set up dependencies for the initial tasks
+    chain(ref_table_created, files_to_process, create_cluster_decision)
+    
+    # Create the cluster using the traditional operator since Dataproc operators
+    # don't have TaskFlow API equivalents yet
+    create_cluster = DataprocCreateClusterOperator(
         task_id='create_dataproc_cluster',
         project_id=GCP_PROJECT_ID,
         cluster_config=CLUSTER_CONFIG,
         region=GCP_REGION,
         cluster_name=CLUSTER_NAME,
+        trigger_rule='none_failed_or_skipped',  # Only create if there are files to process
     )
-
-    submit_pyspark_job = DataprocSubmitJobOperator(
-        task_id='submit_pyspark_job',
-        job=PYSPARK_JOB,
-        region=GCP_REGION,
-        project_id=GCP_PROJECT_ID,
-    )
-
-    delete_dataproc_cluster = DataprocDeleteClusterOperator(
+    
+    # Make the create_cluster task depend on the create_cluster_decision
+    create_cluster_decision >> create_cluster
+    
+    # Function to dynamically create file processing tasks
+    @task
+    def process_files(files_to_process, cluster_created):
+        """
+        Process all files that need processing.
+        Returns True if any files were processed, False otherwise.
+        """
+        if not files_to_process or not cluster_created:
+            print("No files to process or cluster not created")
+            return False
+        
+        print(f"Processing {len(files_to_process)} files")
+        return True
+    
+    # Process the files only if the cluster was created
+    processing_needed = process_files(files_to_process, create_cluster_decision)
+    
+    # Delete cluster operator - still using traditional operator
+    delete_cluster = DataprocDeleteClusterOperator(
         task_id='delete_dataproc_cluster',
         project_id=GCP_PROJECT_ID,
         cluster_name=CLUSTER_NAME,
         region=GCP_REGION,
-        trigger_rule='all_done',
+        trigger_rule='all_done',  # Run regardless of upstream task status
     )
+    
+    # Connect tasks
+    create_cluster >> processing_needed >> delete_cluster
+    
+    # For each file that needs processing, create and submit a job
+    @task
+    def create_and_process_files(files_to_process, cluster_created):
+        """
+        Create tasks for each file and process them.
+        This is where we actually create the tasks for each file.
+        """
+        if not files_to_process or not cluster_created:
+            return None
+        
+        processed_files = []
+        
+        for file_name in files_to_process:
+            # Generate the job config for this file
+            job_config = process_file(file_name)
+            
+            # Submit the job (using traditional operator)
+            submit_job = DataprocSubmitJobOperator(
+                task_id=f'submit_job_{file_name.replace(".", "_")}',
+                job=job_config,
+                region=GCP_REGION,
+                project_id=GCP_PROJECT_ID,
+            )
+            
+            # Make sure the cluster is created before submitting the job
+            create_cluster >> submit_job
+            
+            # Record this file as processed
+            file_recorded = record_processed_file(file_name)
+            
+            # Set up dependency between submit and record
+            submit_job >> file_recorded
+            
+            # Make sure delete happens after recording
+            file_recorded >> delete_cluster
+            
+            processed_files.append(file_name)
+        
+        return processed_files
+    
+    # Execute the file processing
+    processed_file_list = create_and_process_files(files_to_process, create_cluster_decision)
 
-    (
-    print_execution_date
-    >> create_dataproc_cluster
-    >> submit_pyspark_job
-    >> delete_dataproc_cluster
-    )
+# Create the DAG
+dag = gcs_to_bq_dag()

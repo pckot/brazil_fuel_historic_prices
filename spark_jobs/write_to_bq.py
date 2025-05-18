@@ -86,20 +86,11 @@ def main():
         print(input_path.split('/')[-1])
         print('\n\n')
 
-        update_reference_tbl_df = spark.createDataFrame(
-            [(input_path.split('/')[-1],)], 
-            ["file_name"]
-        )
-        
-        update_reference_tbl_df = update_reference_tbl_df.withColumn(
-            "processed_at", 
-            F.current_timestamp()
-        )
-        
-        update_reference_tbl_df = update_reference_tbl_df.select(
-            F.col("file_name").cast(StringType()),
-            F.col("processed_at").cast(TimestampType())
-        )
+        update_reference_tbl_df = spark.sql(f"""
+            SELECT 
+                '{input_path.split('/')[-1]}' AS file_name,
+                CURRENT_TIMESTAMP() AS processed_at
+        """)
 
         print("DataFrame Schema:")
         update_reference_tbl_df.printSchema()
@@ -110,6 +101,7 @@ def main():
         update_reference_tbl_df.write \
             .format('bigquery') \
             .option('table', f'{output_dataset}.processed_files_reference') \
+            .option('schema', 'file_name:STRING,processed_at:TIMESTAMP')
             .option('temporaryGcsBucket', temp_bucket.replace('gs://', '')) \
             .option('writeMethod', 'direct') \
             .mode('append') \

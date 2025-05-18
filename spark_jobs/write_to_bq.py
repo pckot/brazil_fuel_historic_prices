@@ -80,12 +80,17 @@ def main():
             .mode('append') \
             .save()
         
-        processed_file_df = spark.createDataFrame(
-            [(input_path.split('/')[-1], F.current_timestamp())], 
-            ['file_name', 'processed_at']
+        update_reference_tbl_df = spark.createDataFrame(
+            [(input_path.split('/')[-1],)],
+            ['file_name']
         )
 
-        processed_file_df.write \
+        update_reference_tbl_df = update_reference_tbl_df.withColumn(
+            'processed_at', 
+            F.current_timestamp()
+        )
+
+        update_reference_tbl_df.write \
             .format('bigquery') \
             .option('table', f'{output_dataset}.processed_files_reference') \
             .mode('append') \

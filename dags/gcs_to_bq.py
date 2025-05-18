@@ -59,7 +59,7 @@ CLUSTER_CONFIG = {
     },
 }
 
-# The main DAG definition using the TaskFlow API
+
 @dag(
     dag_id='gcs_to_bq',
     default_args=DEFAULT_ARGS,
@@ -69,11 +69,6 @@ CLUSTER_CONFIG = {
     tags=['data_ingestion'],
 )
 def gcs_to_bq_dag():
-    
-    # @task
-    # def print_execution_date(**kwargs):
-    #     print(f'Execution date: {kwargs["execution_date"]}')
-    #     return f'Execution date: {kwargs["execution_date"]}'
     
     @task
     def check_create_reference_table():
@@ -140,52 +135,6 @@ def gcs_to_bq_dag():
         return files_to_process
     
     @task
-    def process_file(file_name, **kwargs):
-        """
-        Create PySpark job config for a specific file.
-        """
-        pyspark_job = {
-            'reference': {'project_id': GCP_PROJECT_ID},
-            'placement': {'cluster_name': CLUSTER_NAME},
-            'pyspark_job': {
-                'main_python_file_uri': f'gs://{PIPELINE_BUCKET}/spark_jobs/write_to_bq.py',
-                'args': [
-                    f'gs://{PIPELINE_BUCKET}/{file_name}',
-                    BQ_DATASET_ID,
-                    'fuel_prices',
-                    SPARK_TEMP_BUCKET
-                ],
-                'jar_file_uris': [
-                    'gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.31.1.jar'
-                ],
-                'properties': {
-                    'spark.executor.memory': '1g',
-                    'spark.driver.memory': '2g',
-                    'spark.executor.cores': '1',
-                    'spark.dynamicAllocation.enabled': 'false',
-                },
-            },
-        }
-        return pyspark_job
-    
-    @task
-    def record_processed_file(file_name, **kwargs):
-        """
-        Record the processed file in the reference table.
-        """
-        bq_hook = BigQueryHook(use_legacy_sql=False)
-        
-        query = f"""
-        INSERT INTO `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference` 
-        (file_name, processed_at)
-        VALUES('{file_name}', CURRENT_TIMESTAMP())
-        """
-        
-        bq_hook.run_query(query)
-        print(f"Recorded {file_name} as processed")
-        return True
-    
-    @task
     def should_create_cluster(files_to_process):
         """
         Determine if we should create a cluster based on whether there are files to process.
@@ -195,7 +144,6 @@ def gcs_to_bq_dag():
         return has_files
     
     # Execute the tasks
-    # exec_date = print_execution_date()
     ref_table_created = check_create_reference_table()
     files_to_process = get_files_to_process()
     create_cluster_decision = should_create_cluster(files_to_process)
@@ -203,8 +151,7 @@ def gcs_to_bq_dag():
     # Set up dependencies for the initial tasks
     chain(ref_table_created, files_to_process, create_cluster_decision)
     
-    # Create the cluster using the traditional operator since Dataproc operators
-    # don't have TaskFlow API equivalents yet
+    # Create the cluster using the traditional operator
     create_cluster = DataprocCreateClusterOperator(
         task_id='create_dataproc_cluster',
         project_id=GCP_PROJECT_ID,
@@ -217,24 +164,7 @@ def gcs_to_bq_dag():
     # Make the create_cluster task depend on the create_cluster_decision
     create_cluster_decision >> create_cluster
     
-    # Function to dynamically create file processing tasks
-    @task
-    def process_files(files_to_process, cluster_created):
-        """
-        Process all files that need processing.
-        Returns True if any files were processed, False otherwise.
-        """
-        if not files_to_process or not cluster_created:
-            print("No files to process or cluster not created")
-            return False
-        
-        print(f"Processing {len(files_to_process)} files")
-        return True
-    
-    # Process the files only if the cluster was created
-    processing_needed = process_files(files_to_process, create_cluster_decision)
-    
-    # Delete cluster operator - still using traditional operator
+    # Delete cluster operator
     delete_cluster = DataprocDeleteClusterOperator(
         task_id='delete_dataproc_cluster',
         project_id=GCP_PROJECT_ID,
@@ -243,51 +173,94 @@ def gcs_to_bq_dag():
         trigger_rule='all_done',  # Run regardless of upstream task status
     )
     
-    # Connect tasks
-    create_cluster >> processing_needed >> delete_cluster
-    
-    # For each file that needs processing, create and submit a job
-    @task
-    def create_and_process_files(files_to_process, cluster_created):
-        """
-        Create tasks for each file and process them.
-        This is where we actually create the tasks for each file.
-        """
-        if not files_to_process or not cluster_created:
-            return None
+    # Process files only if there are files to process
+    with TaskGroup(group_id="process_files_group") as process_files_group:
+        @task
+        def prepare_job_config(file_name):
+            """Create PySpark job config for a specific file."""
+            pyspark_job = {
+                'reference': {'project_id': GCP_PROJECT_ID},
+                'placement': {'cluster_name': CLUSTER_NAME},
+                'pyspark_job': {
+                    'main_python_file_uri': f'gs://{PIPELINE_BUCKET}/spark_jobs/write_to_bq.py',
+                    'args': [
+                        f'gs://{PIPELINE_BUCKET}/{file_name}',
+                        BQ_DATASET_ID,
+                        'fuel_prices',
+                        SPARK_TEMP_BUCKET
+                    ],
+                    'jar_file_uris': [
+                        'gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.31.1.jar'
+                    ],
+                    'properties': {
+                        'spark.executor.memory': '1g',
+                        'spark.driver.memory': '2g',
+                        'spark.executor.cores': '1',
+                        'spark.dynamicAllocation.enabled': 'false',
+                    },
+                },
+            }
+            return pyspark_job
         
-        processed_files = []
-        
-        for file_name in files_to_process:
-            # Generate the job config for this file
-            job_config = process_file(file_name)
+        @task
+        def record_processed_file(file_name):
+            """Record the processed file in the reference table."""
+            bq_hook = BigQueryHook(use_legacy_sql=False)
             
-            # Submit the job (using traditional operator)
+            query = f"""
+            INSERT INTO `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference` 
+            (file_name, processed_at)
+            VALUES('{file_name}', CURRENT_TIMESTAMP())
+            """
+            
+            bq_hook.run_query(query)
+            print(f"Recorded {file_name} as processed")
+            return True
+        
+        @task
+        def process_all_files(files_to_process):
+            """Return the list of files to process for dynamic task mapping"""
+            return files_to_process if files_to_process else []
+        
+        # Map over the files to process
+        file_list = process_all_files(files_to_process)
+        job_configs = prepare_job_config.expand(file_name=file_list)
+        
+        # Create a list of DataprocSubmitJobOperator tasks
+        submit_jobs = []
+        for idx, file_name in enumerate(file_list):
+            # We need to use this workaround since we can't use .expand() with traditional operators
+            file_safe_name = file_name.replace(".", "_").replace("-", "_")
             submit_job = DataprocSubmitJobOperator(
-                task_id=f'submit_job_{file_name.replace(".", "_")}',
-                job=job_config,
+                task_id=f'submit_job_{file_safe_name}',
+                job=job_configs[idx],  # This will be resolved at runtime
                 region=GCP_REGION,
                 project_id=GCP_PROJECT_ID,
             )
+            submit_jobs.append(submit_job)
             
-            # Make sure the cluster is created before submitting the job
-            create_cluster >> submit_job
-            
-            # Record this file as processed
-            file_recorded = record_processed_file(file_name)
-            
-            # Set up dependency between submit and record
-            submit_job >> file_recorded
-            
-            # Make sure delete happens after recording
-            file_recorded >> delete_cluster
-            
-            processed_files.append(file_name)
-        
-        return processed_files
+            # Record after job submission
+            recorded = record_processed_file(file_name)
+            submit_job >> recorded
     
-    # Execute the file processing
-    processed_file_list = create_and_process_files(files_to_process, create_cluster_decision)
+    # Create task dependencies
+    create_cluster >> process_files_group >> delete_cluster
+    
+    # Define a task to skip the cluster creation/deletion if no files
+    @task(trigger_rule='none_failed')
+    def finalize_dag(has_files_to_process):
+        if not has_files_to_process:
+            print("No files to process, DAG is complete")
+        else:
+            print("All files processed, DAG is complete")
+        return True
+    
+    # Final task that runs in all cases
+    dag_complete = finalize_dag(create_cluster_decision)
+    
+    # If no files to process, skip the cluster creation and go straight to complete
+    create_cluster_decision >> dag_complete
+    delete_cluster >> dag_complete
 
 # Create the DAG
 dag = gcs_to_bq_dag()

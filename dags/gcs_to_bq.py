@@ -18,6 +18,9 @@ GCP_REGION = os.environ.get('GCP_REGION')
 PIPELINE_BUCKET = os.environ.get('PIPELINE_BUCKET')
 SPARK_TEMP_BUCKET = os.environ.get('SPARK_TEMP_BUCKET')
 
+print('')
+print(f'COMPOSER BUCKET = {COMPOSER_BUCKET}')
+print('')
 
 DEFAULT_ARGS = {
     'owner': 'airflow',
@@ -63,7 +66,7 @@ PYSPARK_JOB = {
     'reference': {'project_id': GCP_PROJECT_ID},
     'placement': {'cluster_name': CLUSTER_NAME},
     'pyspark_job': {
-        'main_python_file_uri': f'gs://{COMPOSER_BUCKET}/spark_jobs/write_to_bq.py',
+        'main_python_file_uri': f'gs://{PIPELINE_BUCKET}/spark_jobs/write_to_bq.py',
         'args': [
             f'gs://{PIPELINE_BUCKET}/fuel_prices_2004_01.csv',
             BQ_DATASET_ID,

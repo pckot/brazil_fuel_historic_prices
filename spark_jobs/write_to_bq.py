@@ -93,6 +93,8 @@ def main():
         update_reference_tbl_df.write \
             .format('bigquery') \
             .option('table', f'{output_dataset}.processed_files_reference') \
+            .option('temporaryGcsBucket', temp_bucket.replace('gs://', '')) \
+            .option('writeMethod', 'direct') \
             .mode('append') \
             .save()
         

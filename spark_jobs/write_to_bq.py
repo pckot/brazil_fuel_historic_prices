@@ -101,7 +101,7 @@ def main():
         update_reference_tbl_df.write \
             .format('bigquery') \
             .option('table', f'{output_dataset}.processed_files_reference') \
-            .option('schema', 'file_name:STRING,processed_at:TIMESTAMP')
+            .option('schema', 'file_name:STRING,processed_at:TIMESTAMP') \
             .option('temporaryGcsBucket', temp_bucket.replace('gs://', '')) \
             .option('writeMethod', 'direct') \
             .mode('append') \

@@ -2,6 +2,7 @@ import sys
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 
 
 def rename_df_columns(df):
@@ -85,15 +86,22 @@ def main():
         print(input_path.split('/')[-1])
         print('\n\n')
 
+        schema = StructType([
+            StructField("file_name", StringType(), nullable=False),
+            StructField("processed_at", TimestampType(), nullable=False)
+        ])
+
+        # Create the DataFrame with explicit schema
         update_reference_tbl_df = spark.createDataFrame(
-            [(input_path.split('/')[-1],)],
-            ['file_name']
+            [(input_path.split('/')[-1], F.current_timestamp())],
+            schema=schema
         )
 
-        update_reference_tbl_df = update_reference_tbl_df.withColumn(
-            'processed_at', 
-            F.current_timestamp()
-        )
+        print("DataFrame Schema:")
+        update_reference_tbl_df.printSchema()
+        
+        print("DataFrame Content:")
+        update_reference_tbl_df.show(truncate=False)
 
         update_reference_tbl_df.write \
             .format('bigquery') \

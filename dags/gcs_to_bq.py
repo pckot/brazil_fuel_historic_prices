@@ -137,19 +137,19 @@ def choose_path(**kwargs):
     else:
         return 'skip_processing'
 
-def record_processed_file(file_name, **kwargs):
-    """Record the processed file in the reference table."""
-    bq_hook = BigQueryHook(use_legacy_sql=False)
-    
-    query = f"""
-    INSERT INTO `{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference` 
-    (file_name, processed_at)
-    VALUES('{file_name}', CURRENT_TIMESTAMP())
-    """
-    
-    bq_hook.run_query(query)
-    print(f"Recorded {file_name} as processed")
-    return True
+# def record_processed_file(file_name, **kwargs):
+#     """Record the processed file in the reference table."""
+#     processed_file_df = spark.createDataFrame(
+#             [(file_name, F.current_timestamp())], 
+#             ['file_name', 'processed_at']
+#         )
+
+#     processed_file_df.write \
+#         .format('bigquery') \
+#         .option('table', f'{output_dataset}.processed_files_reference') \
+#         .mode('append') \
+#         .save()
+#     return True
 
 def create_pyspark_job(file_name):
     """Create PySpark job configuration for a file."""
@@ -273,16 +273,16 @@ with DAG(
             trigger_rule=TriggerRule.ALL_SUCCESS,  # Only execute if cluster was created
         )
         
-        # Record file as processed
-        record_task = PythonOperator(
-            task_id=f'record_{file_safe_name}',
-            python_callable=record_processed_file,
-            op_kwargs={'file_name': file_name},
-            trigger_rule=TriggerRule.ALL_SUCCESS,  # Only execute if processing succeeded
-        )
+        # # Record file as processed
+        # record_task = PythonOperator(
+        #     task_id=f'record_{file_safe_name}',
+        #     python_callable=record_processed_file,
+        #     op_kwargs={'file_name': file_name},
+        #     trigger_rule=TriggerRule.ALL_SUCCESS,  # Only execute if processing succeeded
+        # )
         
         # Set up dependencies
-        create_cluster >> process_task >> record_task >> delete_cluster
+        create_cluster >> process_task >> delete_cluster # >> record_task
     
     # Finalize the DAG
     delete_cluster >> join_task

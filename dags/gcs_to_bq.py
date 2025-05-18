@@ -114,6 +114,10 @@ def get_files_to_process(**kwargs):
     
     # Filter only files that need processing
     files_to_process = [f for f in matching_files if f not in processed_files_list]
+
+    print(f'matching_files = {matching_files}')
+    print(f'processed_files_list = {processed_files_list}')
+    print(f'files_to_process = {files_to_process}')
     
     print(f"Found {len(matching_files)} matching files")
     print(f"Already processed: {len(processed_files_list)} files")

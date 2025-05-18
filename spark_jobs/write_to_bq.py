@@ -86,15 +86,19 @@ def main():
         print(input_path.split('/')[-1])
         print('\n\n')
 
-        schema = StructType([
-            StructField("file_name", StringType(), nullable=False),
-            StructField("processed_at", TimestampType(), nullable=False)
-        ])
-
-        # Create the DataFrame with explicit schema
         update_reference_tbl_df = spark.createDataFrame(
-            [(input_path.split('/')[-1], F.current_timestamp())],
-            schema=schema
+            [(input_path.split('/')[-1],)], 
+            ["file_name"]
+        )
+        
+        update_reference_tbl_df = update_reference_tbl_df.withColumn(
+            "processed_at", 
+            F.current_timestamp()
+        )
+        
+        update_reference_tbl_df = update_reference_tbl_df.select(
+            F.col("file_name").cast(StringType()),
+            F.col("processed_at").cast(TimestampType())
         )
 
         print("DataFrame Schema:")

@@ -80,6 +80,17 @@ def main():
             .mode('append') \
             .save()
         
+        processed_file_df = spark.createDataFrame(
+            [(input_path.split('/')[-1], F.current_timestamp())], 
+            ['file_name', 'processed_at']
+        )
+
+        processed_file_df.write \
+            .format('bigquery') \
+            .option('table', f'{output_dataset}.processed_files_reference') \
+            .mode('append') \
+            .save()
+        
     except Exception as e:
         print(f'Error processing data: {str(e)}')
         raise

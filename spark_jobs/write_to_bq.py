@@ -80,6 +80,11 @@ def main():
             .mode('append') \
             .save()
         
+        print('\n\n')
+        print('INPUT PATH:')
+        print(input_path.split('/')[-1])
+        print('\n\n')
+
         update_reference_tbl_df = spark.createDataFrame(
             [(input_path.split('/')[-1],)],
             ['file_name']

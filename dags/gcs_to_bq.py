@@ -14,6 +14,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.models.baseoperator import chain
+from airflow.utils.task_group import TaskGroup
 
 # Environment variables
 BQ_DATASET_ID = os.environ.get('BQ_DATASET_ID')
@@ -142,35 +143,6 @@ def choose_path(**kwargs):
     else:
         return 'skip_processing'
 
-def record_processed_files(**kwargs):
-    """Record processed files in BigQuery reference table."""
-    ti = kwargs['ti']
-    files_processed = ti.xcom_pull(key='files_to_process', task_ids='get_files_to_process')
-    
-    if not files_processed or len(files_processed) == 0:
-        print("No files were processed, skipping recording")
-        return True
-    
-    bq_hook = BigQueryHook(use_legacy_sql=False)
-    client = bq_hook.get_client()
-    
-    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference"
-    
-    # For each file, insert a record
-    for file_name in files_processed:
-        query = f"""
-        INSERT INTO `{table_id}` (file_name, processed_at)
-        VALUES ('{file_name}', CURRENT_TIMESTAMP())
-        """
-        
-        job_config = bigquery.QueryJobConfig()
-        query_job = client.query(query, job_config=job_config)
-        query_job.result()  # Wait for the job to complete
-        
-        print(f"Recorded {file_name} as processed at {datetime.now()}")
-    
-    return True
-
 def create_pyspark_job(file_name):
     """Create PySpark job configuration for a file."""
     return {
@@ -195,6 +167,50 @@ def create_pyspark_job(file_name):
             },
         },
     }
+
+def should_process_file(file_name, **kwargs):
+    """Check if a specific file should be processed based on runtime data."""
+    ti = kwargs['ti']
+    files_to_process = ti.xcom_pull(key='files_to_process', task_ids='get_files_to_process')
+    
+    if files_to_process and file_name in files_to_process:
+        print(f"File {file_name} needs processing")
+        return f'process_spark_jobs.process_file_{file_name.replace(".", "_").replace("-", "_")}'
+    else:
+        print(f"Skipping file {file_name} (already processed or not matching pattern)")
+        return f'process_spark_jobs.skip_file_{file_name.replace(".", "_").replace("-", "_")}'
+
+def record_processed_files(**kwargs):
+    """Record successfully processed files in BigQuery reference table."""
+    ti = kwargs['ti']
+    files_to_process = ti.xcom_pull(key='files_to_process', task_ids='get_files_to_process')
+    
+    if not files_to_process or len(files_to_process) == 0:
+        print("No files were processed, skipping recording")
+        return True
+    
+    bq_hook = BigQueryHook(use_legacy_sql=False)
+    client = bq_hook.get_client()
+    
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET_ID}.processed_files_reference"
+    
+    # Check which files were actually processed successfully by checking task states
+    # For now, we'll record all files that were in the processing list
+    # In a more sophisticated setup, you'd check individual task success states
+    
+    for file_name in files_to_process:
+        query = f"""
+        INSERT INTO `{table_id}` (file_name, processed_at)
+        VALUES ('{file_name}', CURRENT_TIMESTAMP())
+        """
+        
+        job_config = bigquery.QueryJobConfig()
+        query_job = client.query(query, job_config=job_config)
+        query_job.result()  # Wait for the job to complete
+        
+        print(f"Recorded {file_name} as processed at {datetime.now()}")
+    
+    return True
 
 # Create the DAG
 with DAG(
@@ -239,109 +255,104 @@ with DAG(
         region=GCP_REGION,
         cluster_name=CLUSTER_NAME,
     )
-    
-    # Define placeholder for processing tasks to be defined dynamically
-    process_tasks = []
 
-    # 6. Join paths (will execute regardless of which branch was taken)
-    join_task = EmptyOperator(
-        task_id='join_paths',
-        trigger_rule=TriggerRule.ONE_SUCCESS,
-    )
+    # 6. Get potential files from GCS at DAG definition time (for task creation)
+    # This is a simplified approach - in practice, you might want to define expected files
+    # or use a more dynamic approach
+    try:
+        gcs_hook = GCSHook()
+        all_files = gcs_hook.list(PIPELINE_BUCKET)
+        pattern = r'fuel_prices_\d{4}_\d{2}\.csv'
+        potential_files = [f for f in all_files if re.match(pattern, f)]
+        
+        # Limit to prevent too many tasks (adjust as needed)
+        potential_files = potential_files[:20]
+    except Exception as e:
+        print(f"Could not access GCS at DAG definition time: {e}")
+        # Define some expected files as fallback
+        potential_files = [
+            'fuel_prices_2024_01.csv',
+            'fuel_prices_2024_02.csv',
+            'fuel_prices_2024_03.csv',
+            'fuel_prices_2024_04.csv',
+            'fuel_prices_2024_05.csv'
+        ]
 
-    # 7. Delete Dataproc cluster
-    delete_cluster = DataprocDeleteClusterOperator(
-        task_id='delete_cluster',
-        project_id=GCP_PROJECT_ID,
-        cluster_name=CLUSTER_NAME,
-        region=GCP_REGION,
-        trigger_rule=TriggerRule.ONE_SUCCESS,  # Execute even if upstream fails
-    )
-    
+    # 7. Create TaskGroup for processing files
+    with TaskGroup(group_id='process_spark_jobs') as process_group:
+        
+        file_processing_tasks = []
+        
+        for file_name in potential_files:
+            file_safe_name = file_name.replace(".", "_").replace("-", "_")
+            
+            # Branch task to decide if this specific file should be processed
+            file_branch = BranchPythonOperator(
+                task_id=f'check_file_{file_safe_name}',
+                python_callable=should_process_file,
+                op_kwargs={'file_name': file_name},
+                provide_context=True,
+            )
+            
+            # Task to process the file with Spark
+            process_file_task = DataprocSubmitJobOperator(
+                task_id=f'process_file_{file_safe_name}',
+                job=create_pyspark_job(file_name),
+                region=GCP_REGION,
+                project_id=GCP_PROJECT_ID,
+            )
+            
+            # Task to skip this file
+            skip_file_task = EmptyOperator(
+                task_id=f'skip_file_{file_safe_name}',
+            )
+            
+            # Join task for this file
+            file_join = EmptyOperator(
+                task_id=f'join_file_{file_safe_name}',
+                trigger_rule=TriggerRule.ONE_SUCCESS,
+            )
+            
+            # Set up dependencies for this file
+            file_branch >> [process_file_task, skip_file_task]
+            [process_file_task, skip_file_task] >> file_join
+            
+            file_processing_tasks.append(file_join)
+        
+        # Create a final join task within the group
+        if file_processing_tasks:
+            group_join = EmptyOperator(
+                task_id='all_files_complete',
+                trigger_rule=TriggerRule.ALL_SUCCESS,
+            )
+            file_processing_tasks >> group_join
+
     # 8. Record processed files
     record_files = PythonOperator(
         task_id='record_processed_files',
         python_callable=record_processed_files,
         provide_context=True,
-        trigger_rule=TriggerRule.ALL_SUCCESS,  # Only execute if all processing tasks succeed
+        trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
-    # Set up the initial task dependencies
+    # 9. Delete Dataproc cluster
+    delete_cluster = DataprocDeleteClusterOperator(
+        task_id='delete_cluster',
+        project_id=GCP_PROJECT_ID,
+        cluster_name=CLUSTER_NAME,
+        region=GCP_REGION,
+        trigger_rule=TriggerRule.ONE_SUCCESS,  # Execute even if processing fails
+    )
+
+    # 10. Final join task
+    join_task = EmptyOperator(
+        task_id='join_paths',
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
+    # Set up main task dependencies
     init_ref_table >> get_files >> branch_task
+    
+    # Branch paths
     branch_task >> skip_processing >> join_task
-    branch_task >> create_cluster
-    
-    # Dynamic task creation based on runtime XCom data
-    def process_file(ti, **kwargs):
-        """Function to check if a file should be processed based on runtime data."""
-        files_to_process = ti.xcom_pull(key='files_to_process', task_ids='get_files_to_process')
-        file_name = kwargs.get('file_name')
-        
-        if files_to_process and file_name in files_to_process:
-            print(f"Processing file: {file_name}")
-            return 'process_file'
-        else:
-            print(f"Skipping file: {file_name} (already processed or not matching pattern)")
-            return 'skip_file'
-    
-    # Create tasks for all possible files in the bucket
-    gcs_hook = GCSHook()
-    try:
-        all_files = gcs_hook.list(PIPELINE_BUCKET)
-        
-        # Filter files matching pattern
-        pattern = r'fuel_prices_\d{4}_\d{2}\.csv'
-        potential_files = [f for f in all_files if re.match(pattern, f)][:50]  # Limit to 50 files
-    except Exception:
-        # If we can't access the bucket at DAG definition time, use placeholder
-        potential_files = [f"placeholder_{i}" for i in range(5)]
-    
-    # Create a processing subgraph for each potential file
-    for file_name in potential_files:
-        file_safe_name = file_name.replace(".", "_").replace("-", "_")
-        
-        # Decision task: should this file be processed?
-        file_branch = BranchPythonOperator(
-            task_id=f'check_{file_safe_name}',
-            python_callable=process_file,
-            provide_context=True,
-            op_kwargs={'file_name': file_name},
-            trigger_rule=TriggerRule.ALL_SUCCESS,  # Only execute if cluster was created
-        )
-        
-        # Task to process the file
-        process_file_task = DataprocSubmitJobOperator(
-            task_id=f'process_{file_safe_name}',
-            job=create_pyspark_job(file_name),
-            region=GCP_REGION,
-            project_id=GCP_PROJECT_ID,
-        )
-        
-        # Task to skip processing this file
-        skip_file_task = EmptyOperator(
-            task_id=f'skip_{file_safe_name}',
-        )
-        
-        # Join branches for this file
-        file_join = EmptyOperator(
-            task_id=f'join_{file_safe_name}',
-            trigger_rule=TriggerRule.ONE_SUCCESS,
-        )
-        
-        # Add to list of processing tasks
-        process_tasks.append(file_join)
-        
-        # Set up dependencies for this file's tasks
-        create_cluster >> file_branch
-        file_branch >> process_file_task >> file_join
-        file_branch >> skip_file_task >> file_join
-    
-    # Connect all file processing joins to record_files task
-    # If no files to process, skip directly to deletion
-    if process_tasks:
-        chain(*process_tasks, record_files, delete_cluster)
-    else:
-        create_cluster >> delete_cluster
-    
-    # Finalize the DAG
-    delete_cluster >> join_task # MUST COMMIT AGAIN
+    branch_task >> create_cluster >> process_group >> record_files >> delete_cluster >> join_task

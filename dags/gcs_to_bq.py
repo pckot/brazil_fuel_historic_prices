@@ -199,9 +199,18 @@ def record_processed_files(**kwargs):
     # In a more sophisticated setup, you'd check individual task success states
     
     for file_name in files_to_process:
+        # query = f"""
+        # INSERT INTO `{table_id}` (file_name, processed_at)
+        # VALUES ('{file_name}', CURRENT_TIMESTAMP())
+        # """
+
         query = f"""
-        INSERT INTO `{table_id}` (file_name, processed_at)
-        VALUES ('{file_name}', CURRENT_TIMESTAMP())
+        MERGE `{table_id}` T
+        USING (SELECT '{file_name}' as file_name, CURRENT_TIMESTAMP() AS processed_at) S
+        ON T.file_name = S.file_name
+        WHEN NOT MATCHED THEN
+        INSERT (file_name, processed_at)
+        VALUES (S.file_name, S.processed_at)
         """
         
         job_config = bigquery.QueryJobConfig()

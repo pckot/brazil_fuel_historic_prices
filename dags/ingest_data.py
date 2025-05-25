@@ -58,7 +58,7 @@ def download_with_retry(url, max_retries=3):
 
 def download_fuel_data():
     current_year = datetime.now().year
-    for year in range(2005, current_year + 1):
+    for year in range(2006, current_year + 1):
         for semester in ['01', '02']:
             url = BASE_URL.format(year, semester)
             output_file_name = f'fuel_prices_{year}_{semester}.csv'

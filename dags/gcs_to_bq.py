@@ -221,7 +221,7 @@ def record_processed_files(**kwargs):
     
     return True
 
-# Create the DAG
+
 with DAG(
     dag_id='gcs_to_bq',
     default_args=DEFAULT_ARGS,

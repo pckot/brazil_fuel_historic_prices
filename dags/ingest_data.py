@@ -182,7 +182,7 @@ default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
     'start_date': datetime(2023, 1, 1),
-    'retries': 1,  # Reduced since we have internal retry logic
+    'retries': 1,
     'retry_delay': timedelta(minutes=10),  # Increased delay
 }
 
@@ -193,11 +193,11 @@ with DAG(
     schedule_interval=None,
     catchup=False,
     tags=['fuel-prices'],
-    max_active_runs=1,  # Prevent concurrent runs
+    max_active_runs=1,
 ) as dag:
 
     ingestion_task = PythonOperator(
         task_id='download_and_ingest_fuel_data',
         python_callable=download_fuel_data,
-        execution_timeout=timedelta(hours=2),  # Set execution timeout
+        execution_timeout=timedelta(hours=2),
     )

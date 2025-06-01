@@ -275,7 +275,7 @@ with DAG(
         potential_files = [f for f in all_files if re.match(pattern, f)]
         
         # Limit to prevent too many tasks (adjust as needed)
-        potential_files = potential_files[:20]
+        potential_files = potential_files # [:20]
     except Exception as e:
         print(f"Could not access GCS at DAG definition time: {e}")
         # Define some expected files as fallback
